@@ -1,0 +1,239 @@
+---
+title: "unemployment duration graphs"
+output:
+  pdf_document:
+    toc: false
+geometry: margin=0.8in
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+date: "2026-11-12"
+---
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6, fig.align = "center",
+                      out.width = "100%")
+options(width = 75)  # wraps printed output (like glimpse) to fit the page
+```
+
+```{r chunk-14}
+# =============================================================================
+# Unemployment DURATION: distributions, density curves, long-term share, heatmap
+# Standalone script (does not need the first script to be run)
+# =============================================================================
+
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(lubridate)
+```
+
+```{r 1-load-data-17}
+# ---- 1. Load data ---------------------------------------------------------------
+# Use the SAME path line that worked for you in the first script, e.g.:
+# parquet_path <- "C:/Users/chari/Downloads/cps_master_panel_2005_2026.parquet"
+parquet_path <- "C:/Users/chari/OneDrive/Documents/ddsc unemployment/cps_master_panel_2005_2026.parquet"
+
+# We only care about unemployed people with a valid duration, so we filter
+# BEFORE collecting. That makes the data small and fast to load.
+dur <- open_dataset(parquet_path) |>
+  select(YEAR, MONTH, WTFINL, EMPSTAT, EDUC, DURUNEMP) |>
+  filter(EMPSTAT %in% c(21, 22), DURUNEMP < 999) |>   # unemployed, 999 = not applicable
+  collect()
+```
+
+```{r 2-recode-20}
+# ---- 2. Recode -------------------------------------------------------------------
+dur <- dur |>
+  mutate(
+    date = make_date(YEAR, MONTH, 1),
+    edu_group = case_when(
+      EDUC < 73               ~ "Less than HS",
+      EDUC == 73              ~ "HS graduate",
+      EDUC %in% c(81, 91, 92) ~ "Some college / Associate",
+      EDUC >= 111             ~ "Bachelor's or higher",
+      TRUE                    ~ NA_character_
+    ),
+    edu_group = factor(edu_group,
+                       levels = c("Less than HS", "HS graduate",
+                                  "Some college / Associate", "Bachelor's or higher")),
+    long_term = DURUNEMP >= 27,   # BLS definition of long-term unemployed
+    period = case_when(
+      date <  as.Date("2007-12-01") ~ "Pre-recession (2005-Nov 2007)",
+      date <= as.Date("2009-06-01") ~ "Great Recession (Dec 2007-Jun 2009)",
+      date <  as.Date("2020-02-01") ~ "Recovery (Jul 2009-Jan 2020)",
+      date <= as.Date("2022-12-01") ~ "COVID-19 (Feb 2020-Dec 2022)",
+      TRUE                          ~ "Post-COVID (2023-2026)"
+    ),
+    period = factor(period, levels = c("Pre-recession (2005-Nov 2007)",
+                                       "Great Recession (Dec 2007-Jun 2009)",
+                                       "Recovery (Jul 2009-Jan 2020)",
+                                       "COVID-19 (Feb 2020-Dec 2022)",
+                                       "Post-COVID (2023-2026)"))
+  )
+
+recessions <- tibble::tribble(
+  ~name,              ~start,                ~end,
+  "Great Recession",  as.Date("2007-12-01"), as.Date("2009-06-01"),
+  "COVID-19",         as.Date("2020-02-01"), as.Date("2022-12-01")
+)
+recession_shading <- geom_rect(
+  data = recessions, inherit.aes = FALSE,
+  aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+  fill = "grey60", alpha = 0.25
+)
+
+theme_set(theme_minimal(base_size = 13) +
+            theme(plot.title = element_text(face = "bold"),
+                  legend.position = "bottom"))
+
+edu_colors <- c("Less than HS"             = "#d95f02",
+                "HS graduate"              = "#1b9e77",
+                "Some college / Associate" = "#7570b3",
+                "Bachelor's or higher"     = "#386cb0")
+
+period_colors <- c("Pre-recession (2005-Nov 2007)"       = "#1b9e77",
+                   "Great Recession (Dec 2007-Jun 2009)" = "#d95f02",
+                   "Recovery (Jul 2009-Jan 2020)"        = "#7570b3",
+                   "COVID-19 (Feb 2020-Dec 2022)"        = "#e7298a",
+                   "Post-COVID (2023-2026)"              = "#66a61e")
+
+dir.create("plots", showWarnings = FALSE)
+
+# NOTE ON THE DATA: people tend to report durations in round numbers (4, 8, 13,
+# 26 weeks...), so raw histograms look "spiky". Wider bins / smoothing handle this.
+```
+
+## Plot 7: Histogram of unemployment duration (all years)
+
+```{r plot-7-histogram-of-unemployme-23}
+# ---- Plot 7: Histogram of unemployment duration (all years) ----------------------
+p7 <- dur |>
+  ggplot(aes(DURUNEMP, weight = WTFINL)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))),
+                 binwidth = 4, boundary = 0, fill = "#386cb0", color = "white") +
+  geom_vline(xintercept = 27, linetype = "dashed", color = "firebrick") +
+  annotate("text", x = 28.5, y = Inf, vjust = 2, hjust = 0, color = "firebrick",
+           label = "27+ weeks =\nlong-term unemployed") +
+  scale_y_continuous(labels = percent_format()) +
+  coord_cartesian(xlim = c(0, 104)) +
+  labs(title = "How Long Are People Unemployed?",
+       subtitle = "Distribution of unemployment spells, 2005-2026 (4-week bins, capped at 104 weeks)",
+       x = "Weeks unemployed", y = "Share of unemployed",
+       caption = "Source: CPS, ages 25-54, DURUNEMP, weighted by WTFINL")
+p7
+ggsave("plots/plot7_duration_histogram.png", p7, width = 10, height = 6, dpi = 300)
+```
+
+## Plot 8: Density curves by economic period
+
+```{r plot-8-density-curves-by-econo-27}
+# ---- Plot 8: Density curves by economic period ------------------------------------
+# Weights are rescaled inside each group so every curve has area = 1 and the
+# shapes are comparable even though the periods have different numbers of people.
+dens_period <- dur |>
+  group_by(period) |>
+  mutate(w = WTFINL / sum(WTFINL)) |>
+  ungroup()
+
+p8 <- ggplot(dens_period, aes(DURUNEMP, fill = period, color = period, weight = w)) +
+  geom_density(alpha = 0.25, adjust = 1.5, linewidth = 0.9) +
+  scale_fill_manual(values = period_colors, name = NULL) +
+  scale_color_manual(values = period_colors, name = NULL) +
+  coord_cartesian(xlim = c(0, 100)) +
+  guides(fill = guide_legend(nrow = 2), color = guide_legend(nrow = 2)) +
+  labs(title = "Unemployment Duration Shifts Right During Recessions",
+       subtitle = "Density of unemployment spells by economic period",
+       x = "Weeks unemployed", y = "Density",
+       caption = "Source: CPS, ages 25-54, DURUNEMP, weighted by WTFINL")
+p8
+ggsave("plots/plot8_duration_density_by_period.png", p8, width = 10, height = 6, dpi = 300)
+```
+
+## Plot 10: Share of long-term unemployed (27+ weeks) over time
+
+```{r plot-10-share-of-long-term-une-35}
+# ---- Plot 10: Share of long-term unemployed (27+ weeks) over time -----------------
+lt_month <- dur |>
+  group_by(date) |>
+  summarise(lt_share = sum(WTFINL[long_term]) / sum(WTFINL), .groups = "drop") |>
+  complete(date = seq(min(date), max(date), by = "month")) |>   # gaps for missing months
+  arrange(date) |>
+  mutate(lt_smooth = as.numeric(stats::filter(lt_share, rep(1/12, 12), sides = 1)))
+
+p10 <- ggplot(lt_month, aes(date)) +
+  recession_shading +
+  geom_line(aes(y = lt_share), color = "grey60", linewidth = 0.5, na.rm = TRUE) +
+  geom_line(aes(y = lt_smooth), color = "#08306b", linewidth = 1.1, na.rm = TRUE) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Share of Unemployed Who Are Long-Term Unemployed (27+ Weeks)",
+       subtitle = "Grey = monthly, dark blue = 12-month average | Shaded = Great Recession & COVID-19",
+       x = NULL, y = "Share of unemployed",
+       caption = "Source: CPS, ages 25-54, DURUNEMP, weighted by WTFINL")
+p10
+ggsave("plots/plot10_longterm_share_over_time.png", p10, width = 10, height = 6, dpi = 300)
+```
+
+## Plot 11: Long-term share by education (HS vs. College, smoothed)
+
+```{r plot-11-long-term-share-by-edu-39}
+# ---- Plot 11: Long-term share by education (HS vs. College, smoothed) --------------
+lt_edu <- dur |>
+  filter(edu_group %in% c("HS graduate", "Bachelor's or higher")) |>
+  group_by(date, edu_group) |>
+  summarise(lt_share = sum(WTFINL[long_term]) / sum(WTFINL), .groups = "drop") |>
+  complete(date = seq(min(date), max(date), by = "month"), edu_group) |>
+  group_by(edu_group) |>
+  arrange(date) |>
+  mutate(lt_smooth = as.numeric(stats::filter(lt_share, rep(1/12, 12), sides = 1))) |>
+  ungroup()
+
+p11 <- ggplot(lt_edu, aes(date, lt_smooth, color = edu_group)) +
+  recession_shading +
+  geom_line(linewidth = 1, na.rm = TRUE) +
+  scale_color_manual(values = edu_colors, name = NULL) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Long-Term Unemployment: HS Graduates vs. College Graduates",
+       subtitle = "Share of unemployed out of work 27+ weeks (12-month average)",
+       x = NULL, y = "Share long-term unemployed",
+       caption = "Source: CPS, ages 25-54, DURUNEMP, weighted by WTFINL")
+p11
+ggsave("plots/plot11_longterm_share_by_education.png", p11, width = 10, height = 6, dpi = 300)
+```
+
+## Plot 12: Heatmap - duration bucket share by year
+
+```{r plot-12-heatmap-duration-bucke-43}
+# ---- Plot 12: Heatmap - duration bucket share by year -----------------------------
+heat <- dur |>
+  mutate(dur_bucket = cut(DURUNEMP, breaks = c(-Inf, 4, 14, 26, 52, Inf),
+                          labels = c("< 5 wks", "5-14 wks", "15-26 wks",
+                                     "27-52 wks", "53+ wks"))) |>
+  group_by(YEAR, dur_bucket) |>
+  summarise(w = sum(WTFINL), .groups = "drop") |>
+  group_by(YEAR) |>
+  mutate(share = w / sum(w)) |>
+  ungroup()
+
+p12 <- ggplot(heat, aes(factor(YEAR), dur_bucket, fill = share)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = percent(share, accuracy = 1)), size = 3,
+            color = ifelse(heat$share > 0.35, "white", "black")) +
+  scale_fill_viridis_c(option = "magma", direction = -1, labels = percent_format(),
+                       name = "Share of\nunemployed") +
+  labs(title = "Unemployment Duration Mix by Year",
+       subtitle = "Each column sums to 100% (2026 = partial year)",
+       x = NULL, y = NULL,
+       caption = "Source: CPS, ages 25-54, DURUNEMP, weighted by WTFINL") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right", panel.grid = element_blank())
+p12
+ggsave("plots/plot12_duration_heatmap_by_year.png", p12, width = 11, height = 5, dpi = 300)
+
+message("All plots saved to the 'plots/' folder.")
+```

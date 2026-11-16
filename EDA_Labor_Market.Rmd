@@ -1,0 +1,269 @@
+---
+title: "EDA: Labor Market Tightness, Matching Function & Variance Decomposition"
+author: "Erik Petersen"
+date: "2026-11-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+# 1. Libraries and data
+
+Packages needed (install once): dplyr, tidyr, ggplot2, lubridate, scales, moments.
+
+The matching function needs vacancy data, which is not in your hazards file. The code
+below downloads two FRED series if they are not already in your folder:
+JTSJOL (job openings, thousands) and UNEMPLOY (unemployed persons, thousands).
+
+```{r load}
+library(dplyr); library(tidyr); library(ggplot2)
+library(lubridate); library(scales); library(moments)
+
+DATA_DIR   <- "~/Desktop/Analyzing_Unemployment"
+HAZARD_CSV <- file.path(DATA_DIR, "cps_monthly_hazards.csv")
+JOLTS_CSV  <- file.path(DATA_DIR, "JTSJOL.csv")
+UNEMP_CSV  <- file.path(DATA_DIR, "UNEMPLOY.csv")
+
+if (!file.exists(JOLTS_CSV))
+  download.file("https://fred.stlouisfed.org/graph/fredgraph.csv?id=JTSJOL", JOLTS_CSV, mode = "wb")
+if (!file.exists(UNEMP_CSV))
+  download.file("https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNEMPLOY", UNEMP_CSV, mode = "wb")
+stopifnot(file.exists(HAZARD_CSV), file.exists(JOLTS_CSV), file.exists(UNEMP_CSV))
+
+hazards <- read.csv(HAZARD_CSV)
+```
+
+# 2. Data preparation
+
+March to July 2020 are excluded from all analysis. The Shimer-adjusted rates blow up in
+those months (for example, s = 30% in March 2020 against 9% raw), and the steady-state
+formulas used below do not apply when unemployment is far from steady state.
+
+```{r prep}
+covid_start <- as.Date("2020-03-01"); covid_end <- as.Date("2020-07-01")
+
+df_all <- hazards %>%
+  mutate(Date = make_date(YEAR, MONTH, 1),
+         f_t  = f_shimer) %>%
+  filter(!is.na(f_t), !is.na(s_t), f_t > 0, f_t < 1, s_t > 0) %>%
+  arrange(Date) %>%
+  mutate(
+    log_f = log(f_t), log_s = log(s_t),
+    u_ss  = s_t / (s_t + f_t),
+    Regime = factor(case_when(
+      Date >= as.Date("2007-12-01") & Date <= as.Date("2009-06-01") ~ "Great Recession",
+      Date >= covid_start & Date <= covid_end                       ~ "COVID Spike",
+      TRUE                                                         ~ "Normal Expansion"),
+      levels = c("Normal Expansion", "Great Recession", "COVID Spike")))
+
+df <- df_all %>% filter(Regime != "COVID Spike")
+cat("Total months:", nrow(df_all), "| Months used (ex-COVID spike):", nrow(df), "\n")
+
+regime_cols <- c("Normal Expansion" = "gray55", "Great Recession" = "firebrick")
+
+theme_dsdc <- theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(color = "gray40", size = 10),
+        legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+# 3. Distributions and skewness
+
+Kurtosis is raw (a normal distribution = 3).
+
+```{r dist}
+vars <- list("f (job finding rate)"  = df$f_t,
+             "s (separation rate)"   = df$s_t,
+             "ln f"                  = df$log_f,
+             "ln s"                  = df$log_s,
+             "u* = s/(s+f)"          = df$u_ss)
+
+dist_tbl <- data.frame(
+  Metric       = names(vars),
+  Mean         = sapply(vars, mean),
+  Median       = sapply(vars, median),
+  SD           = sapply(vars, sd),
+  Skewness     = sapply(vars, skewness),
+  Kurtosis_raw = sapply(vars, kurtosis),
+  row.names = NULL) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+print(dist_tbl)
+
+df %>%
+  select(`f` = f_t, `ln f` = log_f, `s` = s_t, `ln s` = log_s) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(Value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = "steelblue", alpha = 0.7, color = "white") +
+  geom_density(linewidth = 0.7) +
+  facet_wrap(~ Variable, scales = "free", ncol = 2) +
+  labs(title = "Distributions of Job Finding and Separation Rates",
+       subtitle = "COVID spike months excluded. f is bimodal; s is right-skewed, and logs make it roughly symmetric.",
+       x = NULL, y = "Density") +
+  theme_dsdc
+```
+
+# 4. Rates over time: raw vs. Shimer-adjusted
+
+```{r ts}
+ts_df <- df_all %>%
+  mutate(across(c(s_t, f_t, s_raw, f_raw), ~ ifelse(Regime == "COVID Spike", NA, .x))) %>%
+  select(Date, `Separation rate (s)` = s_t, `Separation, raw` = s_raw,
+         `Finding rate (f)` = f_t, `Finding, raw` = f_raw) %>%
+  pivot_longer(-Date, names_to = "Series", values_to = "Value") %>%
+  mutate(Panel = ifelse(grepl("Separation", Series), "Separation rate", "Finding rate"),
+         Type  = ifelse(grepl("raw", Series), "Raw", "Shimer-adjusted"))
+
+ggplot(ts_df, aes(Date, Value, color = Type, linetype = Type)) +
+  annotate("rect", xmin = as.Date("2007-12-01"), xmax = as.Date("2009-06-01"),
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = "firebrick") +
+  geom_line(linewidth = 0.6, na.rm = TRUE) +
+  facet_wrap(~ Panel, scales = "free_y", ncol = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_color_manual(values = c("Raw" = "gray50", "Shimer-adjusted" = "steelblue")) +
+  labs(title = "Monthly Separation and Finding Rates",
+       subtitle = "Shaded = Great Recession. COVID spike months (Mar-Jul 2020) left blank.",
+       x = NULL, y = NULL, color = NULL, linetype = NULL) +
+  theme_dsdc
+```
+
+# 5. Scatterplot: separation rate vs. job finding rate
+
+Both rates are on log scales. The raw and Shimer-adjusted versions are shown side by side
+because they behave differently (see the correlations).
+
+```{r scatter_sf}
+sf <- bind_rows(
+  df %>% transmute(Series = "Shimer-adjusted", Regime, s = s_t, f = f_t),
+  df %>% filter(!is.na(s_raw), !is.na(f_raw), s_raw > 0, f_raw > 0) %>%
+    transmute(Series = "Raw", Regime, s = s_raw, f = f_raw))
+
+cor_tbl <- sf %>%
+  group_by(Series) %>%
+  summarise(Spearman_ln_s_ln_f = round(cor(log(s), log(f), method = "spearman"), 3),
+            .groups = "drop")
+print(cor_tbl)
+
+ggplot(sf, aes(s, f, color = Regime)) +
+  geom_point(alpha = 0.8, size = 2) +
+  geom_smooth(aes(group = 1), method = "lm", se = FALSE,
+              color = "black", linewidth = 0.7) +
+  facet_wrap(~ Series, scales = "free") +
+  scale_x_log10(labels = percent_format(accuracy = 0.1)) +
+  scale_y_log10(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = regime_cols) +
+  labs(title = "Separation Rate vs. Job Finding Rate (log-log)",
+       subtitle = "COVID spike months excluded. Line = linear fit on the log scale.",
+       x = "Monthly separation rate (s)", y = "Monthly job finding rate (f)", color = NULL) +
+  theme_dsdc
+```
+
+# 6. Scatterplot: empirical matching function
+
+The model is ln f = ln A + alpha * ln(theta), with tightness theta = job openings / unemployed
+(JOLTS openings over the BLS unemployed count). Note: defining theta from f itself
+(for example theta = f/(1-f)) would make this regression circular, so it is not used here.
+
+```{r matching}
+read_fred <- function(path, name) {
+  x <- read.csv(path)
+  names(x)[1:2] <- c("date", name)
+  x$date <- as.Date(x$date)
+  x[[name]] <- suppressWarnings(as.numeric(x[[name]]))
+  x
+}
+
+fred <- inner_join(read_fred(JOLTS_CSV, "vac"), read_fred(UNEMP_CSV, "unemp"), by = "date") %>%
+  mutate(Date = floor_date(date, "month"),
+         theta_t = vac / unemp) %>%
+  filter(is.finite(theta_t), theta_t > 0) %>%
+  select(Date, theta_t)
+
+df_m <- df %>%
+  inner_join(fred, by = "Date") %>%
+  mutate(log_theta = log(theta_t))
+cat("Months in matching sample:", nrow(df_m), "\n")
+
+matching_model <- lm(log_f ~ log_theta, data = df_m)
+alpha_est <- round(coef(matching_model)[["log_theta"]], 3)
+r2_est    <- round(summary(matching_model)$r.squared, 3)
+print(summary(matching_model))
+
+ggplot(df_m, aes(log_theta, log_f)) +
+  geom_point(aes(color = Regime), alpha = 0.8, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "black",
+              linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = regime_cols) +
+  labs(title = "Empirical Matching Function (JOLTS openings / unemployed)",
+       subtitle = paste0("OLS alpha = ", alpha_est, " | R-squared = ", r2_est,
+                         " | COVID spike months excluded"),
+       x = "ln(theta) = ln(openings / unemployed)",
+       y = "ln(f): log job finding rate", color = NULL) +
+  theme_dsdc
+```
+
+The standard errors in the regression summary are not corrected for autocorrelation, so
+treat them as too small. The alpha estimate itself is a reasonable descriptive number.
+
+# 7. Variance decomposition of steady-state unemployment
+
+Since u* = s/(s+f), the log-linearization is d ln u* = (1 - u)(d ln s - d ln f). Both
+terms carry (1 - u). Each share is cov(d ln u*, component) / var(d ln u*), so the two
+shares plus a small linearization residual add to 100%.
+
+This is a static benchmark: it treats unemployment as if it adjusted instantly to its steady
+state, so it tends to overstate the separation margin relative to dynamic decompositions.
+
+```{r decomp}
+static_decomp <- function(d) {
+  ubar <- mean(d$u_ss)
+  dlu  <- log(d$u_ss) - mean(log(d$u_ss))
+  ds   <- log(d$s_t)  - mean(log(d$s_t))
+  dfr  <- log(d$f_t)  - mean(log(d$f_t))
+  v    <- var(dlu)
+  sh_s <- cov(dlu,  (1 - ubar) * ds)  / v
+  sh_f <- cov(dlu, -(1 - ubar) * dfr) / v
+  c(Separations = round(100 * sh_s, 1),
+    Finding     = round(100 * sh_f, 1),
+    Residual    = round(100 * (1 - sh_s - sh_f), 1))
+}
+
+static_tbl <- rbind(
+  "Excl. COVID spike"                  = static_decomp(df),
+  "Excl. COVID spike & Great Recession" = static_decomp(filter(df, Regime == "Normal Expansion")))
+print(static_tbl)
+
+decomp_df <- data.frame(
+  Sample    = rep(rownames(static_tbl), each = 2),
+  Component = rep(c("Separations", "Finding"), times = nrow(static_tbl)),
+  Share     = as.vector(t(static_tbl[, c("Separations", "Finding")])))
+
+ggplot(decomp_df, aes(Sample, Share / 100, fill = Component)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.9) +
+  geom_text(aes(label = paste0(Share, "%")), position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.5) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = c(Separations = "#e53935", Finding = "#1e88e5")) +
+  labs(title = "Static Variance Decomposition of Steady-State Unemployment",
+       subtitle = "Share of var(ln u*) from separations vs. job finding (static benchmark)",
+       x = NULL, y = "Share of variance", fill = NULL) +
+  theme_dsdc
+```
+
+# 8. Takeaways
+
+* **Finding rate (f):** bimodal, with modes near 20% and 32% per month. It is not right-skewed.
+* **Separation rate (s):** right-skewed because of a few high months (Dec 2008 and Jan 2009
+  in the Great Recession). Logs make it roughly symmetric.
+* **Raw vs. adjusted rates:** the ln s / ln f correlation is positive for the Shimer-adjusted
+  series and negative for the raw series. Treat the adjusted rates with caution.
+* **Matching function:** alpha is about 0.3, below the 0.5-0.7 often cited. The estimate
+  depends on how f and theta are defined here.
+* **Variance decomposition:** the static benchmark gives separations about 62-68% and finding
+  about 32-38%. A dynamic version, which lets unemployment adjust gradually, would give
+  separations a smaller share, closer to an even split.
+* **Scope:** March to July 2020 is excluded everywhere, so none of this speaks to the pandemic spike.

@@ -1,0 +1,449 @@
+---
+title: "EDA: Shimer Variance Decomposition"
+subtitle: "DDSC Project Fall 2026"
+output:
+  html_document:
+    toc: true
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5.5, dpi = 150)
+```
+
+This notebook explores the inputs and outputs of the **variance decomposition**
+section of `DDSC_Economics_Features_Fall2026.R`:
+
+* the job-finding hazard `lambda_t` and separation hazard `s_t`
+* how volatile each one is, overall and across business-cycle periods
+* the steady-state ("bathtub") unemployment rate `u* = s / (s + lambda)`
+* the counterfactual series and the betas `beta_lambda`, `beta_s`
+
+All the decomposition math matches the features script, so the numbers here
+line up with what that script prints.
+
+# Setup
+
+```{r libraries}
+library(tidyverse)
+library(scales)
+library(zoo)
+
+data_dir <- "/Users/jared/Desktop/Analyzing Unemployment/"
+out_dir  <- file.path(data_dir, "eda_output", "variance_decomposition")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# NBER recessions, for shading
+recessions <- tibble(
+  start = as.Date(c("2007-12-01", "2020-02-01")),
+  end   = as.Date(c("2009-06-01", "2020-04-01"))
+)
+shade <- geom_rect(
+  data = recessions, inherit.aes = FALSE,
+  aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+  fill = "grey70", alpha = 0.35
+)
+
+rate_colors <- c("Job-finding (lambda)" = "#1b6ca8", "Separation (s)" = "#c0392b")
+
+# Rolling statistic that tolerates a few missing months in the window
+roll_stat <- function(x, k, f, min_obs = ceiling(0.8 * k)) {
+  rollapply(x, k, align = "center", fill = NA,
+            FUN = function(z) if (sum(!is.na(z)) >= min_obs) f(z[!is.na(z)]) else NA_real_)
+}
+```
+
+# Data prep
+
+The same construction as the features script, plus three things for the EDA:
+
+1. **A complete monthly calendar.** Sept and Oct 2025 are missing (the Oct 2025
+   CPS wasn't collected), so they're added as `NA` rows and lines show a gap
+   instead of joining across it.
+2. **Business-cycle periods** for the volatility comparison.
+3. **Hazards built from raw gross flows** (`-log(1 - f_raw)`, `-log(1 - s_raw)`),
+   used as a robustness check because the `f_shimer` / `s_t` formulas in the
+   cleaning script don't follow Shimer (2012) exactly.
+
+```{r prep}
+hazards <- read_csv(file.path(data_dir, "cps_monthly_hazards.csv")) %>%
+  mutate(date = make_date(YEAR, MONTH, 1))
+
+all_months <- tibble(date = seq(min(hazards$date), max(hazards$date), by = "month"))
+
+df <- all_months %>%
+  left_join(hazards, by = "date") %>%
+  mutate(
+    YEAR  = year(date),
+    MONTH = month(date),
+
+    # --- exactly as in DDSC_Economics_Features_Fall2026.R ---
+    u_actual       = U_t / (E_t + U_t),
+    u_steady_state = s_t / (s_t + lambda_t),
+
+    # --- robustness: hazards from raw month-to-month flows ---
+    lambda_flow = -log(1 - f_raw),
+    s_flow      = -log(1 - s_raw),
+
+    period = case_when(
+      date <  as.Date("2007-12-01") ~ "2005-07 expansion",
+      date <= as.Date("2009-06-01") ~ "Great Recession",
+      date <  as.Date("2020-02-01") ~ "2009-20 expansion",
+      date <= as.Date("2020-12-01") ~ "COVID (2020)",
+      TRUE                          ~ "2021-26"
+    ),
+    period = factor(period, levels = c("2005-07 expansion", "Great Recession",
+                                       "2009-20 expansion", "COVID (2020)", "2021-26")),
+    covid_spike = date >= as.Date("2020-03-01") & date <= as.Date("2020-06-01")
+  )
+
+# Counterfactuals use full-sample means, as in the features script
+mean_s      <- mean(df$s_t, na.rm = TRUE)
+mean_lambda <- mean(df$lambda_t, na.rm = TRUE)
+
+df <- df %>%
+  mutate(
+    u_ss_lambda_only = mean_s / (mean_s + lambda_t),
+    u_ss_s_only      = s_t / (s_t + mean_lambda)
+  )
+
+cat("Months in sample:", sum(!is.na(df$s_t)),
+    "| missing months:", paste(format(df$date[is.na(df$s_t)], "%Y-%m"), collapse = ", "), "\n")
+```
+
+# 1. Separation and job-finding rates over time
+
+Each month is shown faintly, with a 12-month centered moving average on top.
+The two rates are on very different scales (lambda is about 0.3, s about 0.02),
+so each gets its own panel.
+
+```{r rates-ts, fig.height = 7}
+rates_long <- df %>%
+  select(date, `Job-finding (lambda)` = lambda_t, `Separation (s)` = s_t) %>%
+  pivot_longer(-date, names_to = "rate", values_to = "value") %>%
+  group_by(rate) %>%
+  mutate(ma12 = roll_stat(value, 12, mean)) %>%
+  ungroup()
+
+p_rates <- ggplot(rates_long, aes(date, color = rate)) +
+  shade +
+  geom_line(aes(y = value), alpha = 0.3, linewidth = 0.4) +
+  geom_line(aes(y = ma12), linewidth = 1) +
+  facet_wrap(~rate, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = rate_colors) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Continuous-time job-finding and separation hazards",
+       subtitle = "Monthly (faint) and 12-month moving average (bold); shaded = NBER recessions",
+       x = NULL, y = "Monthly hazard rate") +
+  theme_minimal() +
+  theme(legend.position = "none")
+p_rates
+ggsave(file.path(out_dir, "01_rates_timeseries.png"), p_rates, width = 9, height = 7, dpi = 300)
+```
+
+To compare the *shape* of the two cycles directly, index each smoothed series
+to its own pre-recession (2005–07) average:
+
+```{r rates-indexed}
+base <- df %>% filter(period == "2005-07 expansion") %>%
+  summarize(l0 = mean(lambda_t, na.rm = TRUE), s0 = mean(s_t, na.rm = TRUE))
+
+p_indexed <- df %>%
+  transmute(date,
+            `Job-finding (lambda)` = 100 * roll_stat(lambda_t, 12, mean) / base$l0,
+            `Separation (s)`       = 100 * roll_stat(s_t, 12, mean) / base$s0) %>%
+  pivot_longer(-date, names_to = "rate", values_to = "index") %>%
+  ggplot(aes(date, index, color = rate)) +
+  shade +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = rate_colors) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Hazards relative to their 2005-07 average",
+       subtitle = "12-month moving averages, 2005-07 mean = 100",
+       x = NULL, y = "Index", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+p_indexed
+ggsave(file.path(out_dir, "02_rates_indexed.png"), p_indexed, width = 9, height = 5.5, dpi = 300)
+```
+
+# 2. Volatility
+
+## Summary table
+
+The raw standard deviation isn't comparable across the two rates because
+their levels differ by a factor of about 15. The **coefficient of variation**
+(SD / mean) and the **SD of the log** both measure volatility in percentage
+terms, which is what the decomposition responds to.
+
+```{r vol-table}
+vol_stats <- function(x) {
+  x <- x[is.finite(x)]
+  tibble(N = length(x), Mean = mean(x), SD = sd(x), CV = sd(x) / mean(x),
+         `SD(log)` = sd(log(x)), Min = min(x), Max = max(x))
+}
+
+vol_table <- bind_rows(
+  df %>% summarize(vol_stats(lambda_t)) %>% mutate(Rate = "lambda_t", Sample = "Full"),
+  df %>% summarize(vol_stats(s_t))      %>% mutate(Rate = "s_t",      Sample = "Full"),
+  df %>% filter(!covid_spike) %>% summarize(vol_stats(lambda_t)) %>% mutate(Rate = "lambda_t", Sample = "Excl. Mar-Jun 2020"),
+  df %>% filter(!covid_spike) %>% summarize(vol_stats(s_t))      %>% mutate(Rate = "s_t",      Sample = "Excl. Mar-Jun 2020")
+) %>%
+  select(Rate, Sample, everything()) %>%
+  mutate(across(where(is.double), ~ round(.x, 4)))
+
+vol_table
+write_csv(vol_table, file.path(out_dir, "volatility_summary.csv"))
+```
+
+## Volatility by business-cycle period
+
+```{r vol-period}
+vol_period <- df %>%
+  filter(!is.na(s_t)) %>%
+  group_by(period) %>%
+  summarize(
+    months      = n(),
+    mean_lambda = mean(lambda_t), sd_lambda = sd(lambda_t), cv_lambda = sd_lambda / mean_lambda,
+    mean_s      = mean(s_t),      sd_s      = sd(s_t),      cv_s      = sd_s / mean_s,
+    .groups = "drop"
+  )
+
+vol_period %>% mutate(across(where(is.double), ~ round(.x, 4)))
+write_csv(vol_period, file.path(out_dir, "volatility_by_period.csv"))
+
+p_vol_period <- vol_period %>%
+  select(period, `Job-finding (lambda)` = cv_lambda, `Separation (s)` = cv_s) %>%
+  pivot_longer(-period, names_to = "rate", values_to = "cv") %>%
+  ggplot(aes(period, cv, fill = rate)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_text(aes(label = number(cv, accuracy = 0.01)),
+            position = position_dodge(width = 0.75), vjust = -0.4, size = 3.2) +
+  scale_fill_manual(values = rate_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Volatility of each hazard by period",
+       subtitle = "Coefficient of variation (SD / mean) of monthly values",
+       x = NULL, y = "Coefficient of variation", fill = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+p_vol_period
+ggsave(file.path(out_dir, "03_volatility_by_period.png"), p_vol_period, width = 9, height = 5.5, dpi = 300)
+```
+
+## Rolling volatility
+
+A 24-month rolling SD of the **log** hazard: how much each rate swings, in
+percentage terms, at each point in time.
+
+```{r vol-rolling}
+p_vol_roll <- df %>%
+  transmute(date,
+            `Job-finding (lambda)` = roll_stat(log(lambda_t), 24, sd),
+            `Separation (s)`       = roll_stat(log(s_t), 24, sd)) %>%
+  pivot_longer(-date, names_to = "rate", values_to = "roll_sd") %>%
+  ggplot(aes(date, roll_sd, color = rate)) +
+  shade +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = rate_colors) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Rolling volatility of the hazards",
+       subtitle = "24-month centered rolling SD of log(hazard)",
+       x = NULL, y = "SD of log hazard", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+p_vol_roll
+ggsave(file.path(out_dir, "04_volatility_rolling.png"), p_vol_roll, width = 9, height = 5.5, dpi = 300)
+```
+
+## Seasonality versus the cycle
+
+Much of the month-to-month movement is seasonal (separations spike every
+December and June). This splits each log hazard's variance into the part
+explained by calendar-month dummies and the rest.
+
+```{r seasonality}
+season_share <- function(y, month) {
+  ok <- is.finite(y)
+  summary(lm(y[ok] ~ factor(month[ok])))$r.squared
+}
+season_tbl <- tibble(
+  Rate = c("lambda_t", "s_t"),
+  `Share of log-variance from calendar month` = c(
+    season_share(log(df$lambda_t), df$MONTH),
+    season_share(log(df$s_t), df$MONTH)
+  )
+) %>% mutate(across(where(is.double), ~ round(.x, 3)))
+season_tbl
+```
+
+# 3. The bathtub: steady-state vs. actual unemployment
+
+The decomposition is run on `u_steady_state`, so it's worth checking how well
+it tracks the actual CPS rate.
+
+```{r bathtub}
+bath_long <- df %>%
+  select(date, `Actual (U / (E + U))` = u_actual, `Steady state s / (s + lambda)` = u_steady_state) %>%
+  pivot_longer(-date, names_to = "series", values_to = "u") %>%
+  group_by(series) %>%
+  mutate(ma12 = roll_stat(u, 12, mean)) %>%
+  ungroup()
+
+p_bath <- ggplot(bath_long, aes(date, color = series)) +
+  shade +
+  geom_line(aes(y = u), alpha = 0.3, linewidth = 0.4) +
+  geom_line(aes(y = ma12), linewidth = 1) +
+  scale_color_manual(values = c("#333333", "#e67e22")) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  coord_cartesian(ylim = c(0, 0.15)) +
+  labs(title = "Actual vs. steady-state unemployment rate",
+       subtitle = "Monthly (faint) and 12-month MA (bold); y-axis clipped at 15% (Mar 2020 steady state is ~37%)",
+       x = NULL, y = "Unemployment rate", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+p_bath
+ggsave(file.path(out_dir, "05_bathtub_actual_vs_steady_state.png"), p_bath, width = 9, height = 5.5, dpi = 300)
+
+cat("Correlation, actual vs. steady state (monthly):",
+    round(cor(df$u_actual, df$u_steady_state, use = "complete.obs"), 3), "\n")
+cat("Correlation, actual vs. steady state (12-month MA):",
+    round(cor(roll_stat(df$u_actual, 12, mean), roll_stat(df$u_steady_state, 12, mean),
+              use = "complete.obs"), 3), "\n")
+```
+
+# 4. Counterfactual steady states
+
+The two counterfactuals behind the decomposition: let only lambda move
+(s held at its mean), or only s move (lambda held at its mean). Whichever
+line follows the orange steady-state line more closely is doing more of the
+work.
+
+```{r counterfactuals}
+cf_long <- df %>%
+  select(date,
+         `Steady state (both vary)` = u_steady_state,
+         `Only lambda varies`       = u_ss_lambda_only,
+         `Only s varies`            = u_ss_s_only) %>%
+  pivot_longer(-date, names_to = "series", values_to = "u") %>%
+  group_by(series) %>%
+  mutate(ma12 = roll_stat(u, 12, mean)) %>%
+  ungroup()
+
+p_cf <- ggplot(cf_long, aes(date, ma12, color = series)) +
+  shade +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("Steady state (both vary)" = "#e67e22",
+                                "Only lambda varies" = "#1b6ca8",
+                                "Only s varies" = "#c0392b")) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Counterfactual steady-state unemployment",
+       subtitle = "12-month moving averages; the other rate is held at its full-sample mean",
+       x = NULL, y = "Steady-state unemployment rate", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+p_cf
+ggsave(file.path(out_dir, "06_counterfactuals.png"), p_cf, width = 9, height = 5.5, dpi = 300)
+```
+
+# 5. The betas
+
+`beta_x = cov(u*, u*_x) / var(u*)` is exactly the OLS slope from regressing
+the counterfactual `u*_x` on `u*`. So the scatter below *is* the
+decomposition: the steeper the fitted line, the bigger that rate's share.
+
+```{r beta-scatter, fig.height = 5}
+p_scatter <- df %>%
+  select(date, u_steady_state, covid_spike,
+         `Only lambda varies` = u_ss_lambda_only, `Only s varies` = u_ss_s_only) %>%
+  pivot_longer(c(`Only lambda varies`, `Only s varies`), names_to = "cf", values_to = "u_cf") %>%
+  filter(!is.na(u_cf)) %>%
+  ggplot(aes(u_steady_state, u_cf)) +
+  geom_point(aes(shape = covid_spike), alpha = 0.6, color = "grey30") +
+  geom_smooth(method = "lm", se = FALSE, color = "#e67e22") +
+  facet_wrap(~cf) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 4), labels = c("Other months", "Mar-Jun 2020")) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Counterfactual vs. actual steady state",
+       subtitle = "Slope of the orange line = beta for that rate (full sample)",
+       x = "Steady-state u* (both vary)", y = "Counterfactual u*", shape = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+p_scatter
+ggsave(file.path(out_dir, "07_beta_scatter.png"), p_scatter, width = 9, height = 5, dpi = 300)
+```
+
+## How sensitive are the betas?
+
+The same decomposition under different choices. The first row reproduces the
+features script.
+
+* **Excl. Mar–Jun 2020:** in March 2020 the steady state hits about 37%. A
+  handful of COVID months can dominate a variance calculation.
+* **12-month MA:** smoothing removes the seasonal noise, leaving the
+  business cycle.
+* **Log deviations:** Shimer (2012) decomposes log changes, not levels.
+* **Raw-flow hazards:** uses `-log(1 - f_raw)` and `-log(1 - s_raw)` instead
+  of the Shimer-adjusted `lambda_t` and `s_t`.
+
+```{r beta-sensitivity}
+decompose <- function(s, l, log_scale = FALSE) {
+  ok <- is.finite(s) & is.finite(l)
+  s <- s[ok]; l <- l[ok]
+  ms <- mean(s); ml <- mean(l)
+  u   <- s / (s + l)
+  u_l <- ms / (ms + l)
+  u_s <- s / (s + ml)
+  if (log_scale) { u <- log(u); u_l <- log(u_l); u_s <- log(u_s) }
+  tibble(beta_lambda = cov(u, u_l) / var(u),
+         beta_s      = cov(u, u_s) / var(u),
+         months      = length(u))
+}
+
+ma <- function(x) roll_stat(x, 12, mean)
+no_covid <- !df$covid_spike
+
+betas <- bind_rows(
+  decompose(df$s_t, df$lambda_t)                                   %>% mutate(Spec = "Features script (full sample, levels)"),
+  decompose(df$s_t[no_covid], df$lambda_t[no_covid])               %>% mutate(Spec = "Excl. Mar-Jun 2020"),
+  decompose(ma(df$s_t), ma(df$lambda_t))                           %>% mutate(Spec = "12-month MA"),
+  decompose(df$s_t, df$lambda_t, log_scale = TRUE)                 %>% mutate(Spec = "Log deviations"),
+  decompose(df$s_flow, df$lambda_flow)                             %>% mutate(Spec = "Raw-flow hazards"),
+  decompose(df$s_flow[no_covid], df$lambda_flow[no_covid])         %>% mutate(Spec = "Raw-flow hazards, excl. Mar-Jun 2020")
+) %>%
+  mutate(sum = beta_lambda + beta_s) %>%
+  select(Spec, months, beta_lambda, beta_s, sum)
+
+betas %>% mutate(across(c(beta_lambda, beta_s, sum), ~ percent(.x, accuracy = 0.1)))
+write_csv(betas, file.path(out_dir, "beta_sensitivity.csv"))
+
+p_betas <- betas %>%
+  mutate(Spec = fct_rev(fct_inorder(Spec))) %>%
+  select(Spec, `Job-finding (lambda)` = beta_lambda, `Separation (s)` = beta_s) %>%
+  pivot_longer(-Spec, names_to = "rate", values_to = "beta") %>%
+  ggplot(aes(beta, Spec, fill = rate)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_text(aes(label = percent(beta, accuracy = 1)),
+            position = position_dodge(width = 0.75), hjust = -0.15, size = 3.2) +
+  geom_vline(xintercept = 0, color = "grey40") +
+  scale_fill_manual(values = rate_colors) +
+  scale_x_continuous(labels = percent_format(), expand = expansion(mult = c(0.02, 0.15))) +
+  labs(title = "Share of steady-state unemployment variance by rate",
+       subtitle = "beta = cov(u*, counterfactual u*) / var(u*)",
+       x = "Contribution", y = NULL, fill = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+p_betas
+ggsave(file.path(out_dir, "08_beta_sensitivity.png"), p_betas, width = 9, height = 5.5, dpi = 300)
+```
+
+The betas don't have to add up to exactly 100%. The gap is the interaction
+between the two rates, since `u* = s / (s + lambda)` isn't linear.
+
+```{r done}
+cat("All tables and plots saved to:", out_dir, "\n")
+```

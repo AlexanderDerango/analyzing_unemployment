@@ -1,0 +1,10 @@
+Variable,N,Mean,SD,Min,P25,Median,P75,Max
+Age (years),8572605,39.514,8.648,25,32,40,47,54
+Female (share),8572605,0.507,0.5,0,0,1,1,1
+Employed (share),8572605,0.785,0.411,0,1,1,1,1
+Unemployed (share),8572605,0.041,0.197,0,0,0,0,1
+Not in labor force (share),8572605,0.175,0.38,0,0,0,0,1
+Unemployment duration (weeks; unemployed only),335181,26.716,31.136,0,4,13,38,124
+Usual weekly hours (employed only),6334030,40.262,9.663,0,40,40,40,99
+E -> U transition (share of all),8572605,0.009,0.094,0,0,0,0,1
+U -> E transition (share of all),8572605,0.01,0.097,0,0,0,0,1

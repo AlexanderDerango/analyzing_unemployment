@@ -1,0 +1,179 @@
+
+"""Bathtub model: steady-state unemployment vs observed unemployment, 2005–2026.
+
+Input: cps_monthly_hazards.csv (placed alongside this script).
+Output: Four PNG figures, summary-statistics CSV, enriched monthly CSV.
+
+Model: du/dt = s(1-u) - f*u, with instantaneous steady state u*=s/(s+f).
+Both rates are used as supplied; results should be treated as an implied equilibrium,
+not a direct estimate of same-month unemployment or a dynamic forecast.
+"""
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+ROOT = Path(__file__).resolve().parent
+CSV_PATH = ROOT / 'cps_monthly_hazards.csv'
+OUT = ROOT / 'bathtub_model_outputs'
+OUT.mkdir(exist_ok=True)
+
+SHOCKS = [
+    ('Great Recession', pd.Timestamp('2007-12-01'), pd.Timestamp('2009-06-30')),
+    ('COVID-19 recession', pd.Timestamp('2020-02-01'), pd.Timestamp('2020-04-30')),
+]
+BLUE, RED, GREEN, GREY = '#2463a6', '#cb584b', '#2b806a', '#777777'
+
+raw = pd.read_csv(CSV_PATH)
+needed = ['YEAR', 'MONTH', 'E_t', 'U_t', 'f_shimer', 's_t']
+missing = sorted(set(needed) - set(raw.columns))
+if missing:
+    raise ValueError(f'Missing columns: {missing}')
+df = raw.copy()
+df['date'] = pd.to_datetime(dict(year=df.YEAR, month=df.MONTH, day=1))
+df = df.sort_values('date').reset_index(drop=True)
+if ((df[['E_t', 'U_t', 'f_shimer', 's_t']] < 0).any().any() or
+        (df['E_t'] + df['U_t'] <= 0).any() or
+        (df['f_shimer'] + df['s_t'] <= 0).any()):
+    raise ValueError('Unexpected negative values or zero denominators')
+
+# Actual: unemployment as proportion of employed + unemployed in this CSV.
+df['actual_pct'] = 100 * df['U_t'] / (df['E_t'] + df['U_t'])
+# Continuous-time two-state bathtub model, using supplied adjusted hazards.
+df['steady_pct'] = 100 * df['s_t'] / (df['s_t'] + df['f_shimer'])
+df['gap_pp'] = df['steady_pct'] - df['actual_pct']
+df['abs_gap_pp'] = df['gap_pp'].abs()
+df['rolling_12m_mae_pp'] = df['abs_gap_pp'].rolling(12, min_periods=12).mean()
+
+# Model comparison statistics are descriptive, NOT a causal test.
+def metrics(x):
+    e = x['gap_pp']
+    a = x['actual_pct']
+    s = x['steady_pct']
+    return {
+        'Months': len(x),
+        'Actual mean (%)': a.mean(),
+        'Steady mean (%)': s.mean(),
+        'Actual std dev (pp)': a.std(ddof=1),
+        'Steady std dev (pp)': s.std(ddof=1),
+        'Mean gap (pp)': e.mean(),
+        'MAE (pp)': e.abs().mean(),
+        'RMSE (pp)': np.sqrt(np.mean(e**2)),
+        'Pearson correlation': a.corr(s),
+        'Actual min (%)': a.min(),
+        'Actual max (%)': a.max(),
+        'Steady min (%)': s.min(),
+        'Steady max (%)': s.max(),
+    }
+
+segments = {
+    'Full sample (2005–2026)': df,
+    'Pre-Great Recession (2005–Nov 2007)': df[df.date < '2007-12-01'],
+    'Great Recession (Dec 2007–Jun 2009)': df[df.date.between('2007-12-01','2009-06-01')],
+    'Post-Great Recession (Jul 2009–2019)': df[df.date.between('2009-07-01','2019-12-01')],
+    'COVID recession (Feb–Apr 2020)': df[df.date.between('2020-02-01','2020-04-01')],
+    'Post-COVID recession (May 2020–2026)': df[df.date >= '2020-05-01'],
+    'Excluding the two recession periods': df[~(df.date.between('2007-12-01','2009-06-01') | df.date.between('2020-02-01','2020-04-01'))],
+}
+stats = pd.DataFrame.from_dict({k: metrics(v) for k,v in segments.items()}, orient='index')
+stats.index.name='Period'
+stats.round(5).to_csv(OUT / 'bathtub_summary_statistics.csv')
+df.to_csv(OUT / 'bathtub_monthly_calculations.csv', index=False)
+
+def shade(ax, legend=False):
+    for name, start, end in SHOCKS:
+        ax.axvspan(start, end, color=GREY, alpha=.19, lw=0, label=name if legend else None, zorder=0)
+
+def xyears(ax, step=2):
+    ax.xaxis.set_major_locator(mdates.YearLocator(step))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.grid(alpha=.18)
+
+def save(fig, fname):
+    fig.savefig(OUT / fname, dpi=200, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+
+# 1 — Observed vs equilibrium, complete period.
+fig, ax = plt.subplots(figsize=(14, 5.8))
+shade(ax)
+ax.plot(df.date, df.actual_pct, color=BLUE, lw=2, label='Observed unemployment share')
+ax.plot(df.date, df.steady_pct, color=RED, lw=1.8, alpha=.88, label='Implied steady-state unemployment')
+ax.set(title='Bathtub Model: Observed vs. Steady-State Unemployment, 2005–2026', ylabel='Unemployment rate (%)', xlabel='Year', xlim=(df.date.min(), df.date.max()))
+xyears(ax)
+ax.legend(loc='upper right', frameon=False, ncol=2)
+fig.text(.5,.005, 'Steady state: 100 × s/(s+f) using adjusted monthly hazards; shading denotes NBER recession dates', ha='center', fontsize=9, color='#555')
+fig.tight_layout(rect=[0,.025,1,1])
+save(fig, '01_steady_state_vs_actual_full_period.png')
+
+# 2 — Separate shock close-ups with shared scale within each shock.
+fig, axes = plt.subplots(1,2,figsize=(15,5.7))
+windows = [('Great Recession: 2006–2012', '2006-01-01','2012-12-01', SHOCKS[0]),
+           ('COVID-19: 2019–2023','2019-01-01','2023-12-01',SHOCKS[1])]
+for ax,(title,start,end,(label,recstart,recend)) in zip(axes,windows):
+    part=df[df.date.between(start,end)]
+    ax.axvspan(recstart,recend,color=GREY,alpha=.23,lw=0,label='NBER recession')
+    ax.plot(part.date,part.actual_pct,color=BLUE,lw=2,label='Observed')
+    ax.plot(part.date,part.steady_pct,color=RED,lw=1.8,label='Steady state')
+    ax.set(title=title, xlabel='Year',ylabel='Unemployment rate (%)',xlim=(part.date.min(),part.date.max()))
+    xyears(ax,1)
+    ax.legend(loc='upper right',frameon=False)
+fig.suptitle('How Well Does the Steady-State Model Track Major Shocks?', fontsize=15, fontweight='bold')
+fig.tight_layout()
+save(fig,'02_steady_state_recession_closeups.png')
+
+# 3 — Error as a signed percentage-point gap plus 12-month average absolute deviation.
+fig,axes=plt.subplots(2,1,figsize=(14,8),sharex=True)
+shade(axes[0]);shade(axes[1])
+axes[0].plot(df.date,df.gap_pp,color=RED,lw=1.35)
+axes[0].fill_between(df.date,df.gap_pp,0,where=(df.gap_pp>=0),color=RED,alpha=.2)
+axes[0].fill_between(df.date,df.gap_pp,0,where=(df.gap_pp<0),color=BLUE,alpha=.17)
+axes[0].axhline(0,color='#333',lw=.85)
+axes[0].set(title='Implied steady state minus observed unemployment',ylabel='Gap (percentage points)')
+axes[1].plot(df.date,df.rolling_12m_mae_pp,color=GREEN,lw=1.8)
+axes[1].set(title='12-month rolling mean absolute gap',ylabel='Mean absolute gap (pp)',xlabel='Year')
+xyears(axes[0]);xyears(axes[1])
+axes[1].set_xlim(df.date.min(),df.date.max())
+fig.suptitle('Bathtub Model: Equilibrium–Actual Deviations Over Time',fontsize=15,fontweight='bold')
+fig.tight_layout()
+save(fig,'03_equilibrium_gap_and_rolling_error.png')
+
+# 4 — Scatter diagnostic, equality reference and time-period categorization.
+fig, ax=plt.subplots(figsize=(8.5,7.3))
+classes = [
+    ('Other months', ~(df.date.between('2007-12-01','2009-06-01') | df.date.between('2020-02-01','2020-04-01')), BLUE),
+    ('Great Recession', df.date.between('2007-12-01','2009-06-01'), '#b87825'),
+    ('COVID recession', df.date.between('2020-02-01','2020-04-01'), RED)
+]
+for label, mask, color in classes:
+    ax.scatter(df.loc[mask,'actual_pct'],df.loc[mask,'steady_pct'],s=30,alpha=.65,c=color,label=f'{label} (n={mask.sum()})')
+max_lim=max(df.actual_pct.max(),df.steady_pct.max())*1.06
+ax.plot([0,max_lim],[0,max_lim],color='#444',linestyle='--',lw=1,label='Perfect agreement (45°)')
+ax.set(xlim=(0,max_lim),ylim=(0,max_lim),xlabel='Observed unemployment (%)',ylabel='Implied steady-state unemployment (%)',title='Steady-State vs. Observed Unemployment: Monthly Scatter')
+ax.grid(alpha=.18)
+ax.legend(frameon=False)
+fig.tight_layout()
+save(fig,'04_model_fit_scatter.png')
+
+# 5 — Publication-ready summary statistics as a PNG table.
+show=stats[['Months','Actual mean (%)','Steady mean (%)','Mean gap (pp)','MAE (pp)','RMSE (pp)','Pearson correlation']].copy()
+show.columns=['Months','Actual mean\n(%)','Steady mean\n(%)','Mean gap\n(pp)','MAE\n(pp)','RMSE\n(pp)','Correlation']
+formatted=show.copy()
+for c in formatted.columns:
+    if c != 'Months': formatted[c] = formatted[c].map(lambda v:f'{v:.2f}')
+formatted['Months']=formatted['Months'].astype(int).astype(str)
+fig,ax=plt.subplots(figsize=(15,4.2))
+ax.axis('off')
+ax.set_title('Bathtub Model: Summary Statistics by Period',fontsize=16,fontweight='bold',pad=18)
+tbl=ax.table(cellText=formatted.values,rowLabels=formatted.index,colLabels=formatted.columns,cellLoc='center',rowLoc='left',loc='center',bbox=[0,0,1,.92])
+tbl.auto_set_font_size(False);tbl.set_fontsize(9)
+for (row,col),cell in tbl.get_celld().items():
+    cell.set_edgecolor('#dddddd');cell.set_linewidth(.5)
+    if row == 0: cell.set_facecolor('#dae6f2'); cell.set_text_props(weight='bold')
+    elif row%2==0: cell.set_facecolor('#f4f6f8')
+fig.tight_layout()
+save(fig,'05_summary_statistics_table.png')
+
+print(f'Processed {len(df)} months: {df.date.min():%Y-%m} to {df.date.max():%Y-%m}')
+print(stats[['Months','Actual mean (%)','Steady mean (%)','Mean gap (pp)','MAE (pp)','RMSE (pp)','Pearson correlation']].round(3).to_string())
+print(f'\nSaved images and CSVs in: {OUT}')

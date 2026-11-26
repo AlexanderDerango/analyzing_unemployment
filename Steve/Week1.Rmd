@@ -1,0 +1,444 @@
+---
+title: "Week 1: Unemployment Data Overview"
+author: "Steve Naing"
+date: "`r Sys.Date()`"
+output: pdf_document
+fontsize: 11pt
+geometry: margin=0.9in
+---
+
+```{r setup, include=FALSE}
+# Set echo = FALSE for a stakeholder version that hides the code.
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+
+library(tidyverse)
+library(readr)
+library(arrow)       # for reading parquet files
+library(scales)
+library(kableExtra)  # install.packages("kableExtra") if missing
+library(gridExtra)   # install.packages("gridExtra") if missing; draws tables as images
+library(grid)
+
+dir.create("figures", showWarnings = FALSE)
+```
+
+```{r theme, include=FALSE}
+# ==============================================================================
+# Shared look: one palette and one theme for every plot
+# ==============================================================================
+col_main   <- "#2C7FB8"   # blue
+col_accent <- "#D95F0E"   # orange
+col_green  <- "#2E8B6E"
+col_purple <- "#6A51A3"
+col_grey   <- "#6B7280"
+
+theme_proj <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title.position   = "plot",
+      plot.caption.position = "plot",
+      plot.title    = element_text(face = "bold", size = rel(1.25), margin = margin(b = 4)),
+      plot.subtitle = element_text(color = col_grey, margin = margin(b = 12)),
+      plot.caption  = element_text(color = col_grey, hjust = 0, margin = margin(t = 10)),
+      axis.title    = element_text(color = col_grey),
+      axis.text     = element_text(color = "grey25"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.4),
+      strip.text    = element_text(face = "bold", hjust = 0),
+      legend.position = "top",
+      legend.justification = "left",
+      plot.margin   = margin(12, 16, 12, 12)
+    )
+}
+```
+
+```{r table-figure-helper, include=FALSE}
+# ==============================================================================
+# Save a data frame as a PNG "table figure"
+# ==============================================================================
+# df            data frame to draw (character columns display best)
+# file          output path, e.g. "figures/tbl_example.png"
+# title, note   text above and below the table
+# align         one of "l", "r", "c" per column (default: first left, rest right)
+# wrap          named vector of wrap widths for long text columns,
+#               e.g. c(Description = 50)
+# bold_last_row make the last row bold (for total rows)
+save_table_png <- function(df, file, title = "", note = "", align = NULL,
+                           wrap = NULL, bold_last_row = FALSE, dpi = 200) {
+  df <- as.data.frame(df, stringsAsFactors = FALSE)
+  nr <- nrow(df); nc <- ncol(df)
+  if (is.null(align)) align <- c("l", rep("r", nc - 1))
+  if (!is.null(wrap)) {
+    for (col in names(wrap)) df[[col]] <- str_wrap(df[[col]], wrap[[col]])
+  }
+
+  hj <- unname(c(l = 0,    c = 0.5, r = 1   )[align])
+  xx <- unname(c(l = 0.04, c = 0.5, r = 0.96)[align])
+
+  face <- rep("plain", nr * nc)
+  if (bold_last_row) face[(seq_len(nc) - 1) * nr + nr] <- "bold"
+  fills <- rep(rep_len(c("white", "#F3F4F6"), nr), nc)
+
+  tt <- ttheme_minimal(
+    base_size = 11,
+    padding = unit(c(5, 3.5), "mm"),
+    core = list(
+      fg_params = list(hjust = rep(hj, each = nr), x = rep(xx, each = nr),
+                       fontface = face, col = "grey15"),
+      bg_params = list(fill = fills, col = NA)),
+    colhead = list(
+      fg_params = list(hjust = hj, x = xx, fontface = "bold", col = "white"),
+      bg_params = list(fill = col_main, col = NA))
+  )
+  g <- tableGrob(df, rows = NULL, theme = tt)
+
+  # Measure the table so the saved image fits it exactly
+  pdf(NULL)
+  w_tbl <- convertWidth(sum(g$widths), "in", valueOnly = TRUE)
+  h_tbl <- convertHeight(sum(g$heights), "in", valueOnly = TRUE)
+  dev.off()
+
+  title_w <- str_wrap(title, max(25, floor(w_tbl * 8.5)))
+  note_w  <- str_wrap(note,  max(30, floor(w_tbl * 12.5)))
+  h_title <- if (nzchar(title)) length(strsplit(title_w, "\n")[[1]]) * 0.27 + 0.2 else 0.1
+  h_note  <- if (nzchar(note))  length(strsplit(note_w,  "\n")[[1]]) * 0.17 + 0.25 else 0.1
+
+  x_left  <- unit(0.5, "npc") - unit(w_tbl / 2, "in")
+  title_g <- textGrob(title_w, x = x_left, y = unit(0.12, "in"), hjust = 0, vjust = 0,
+                      gp = gpar(fontface = "bold", fontsize = 14, col = "grey15",
+                                lineheight = 1.05))
+  note_g  <- textGrob(note_w, x = x_left, y = unit(1, "npc") - unit(0.12, "in"),
+                      hjust = 0, vjust = 1,
+                      gp = gpar(fontsize = 9, col = col_grey, lineheight = 1.15))
+
+  lay <- arrangeGrob(title_g, g, note_g, ncol = 1,
+                     heights = unit.c(unit(h_title, "in"), unit(h_tbl, "in"),
+                                      unit(h_note, "in")),
+                     widths = unit(w_tbl, "in"))
+
+  png(file, width = w_tbl + 0.6, height = h_title + h_tbl + h_note + 0.4,
+      units = "in", res = dpi, bg = "white")
+  grid.newpage()
+  grid.draw(lay)
+  invisible(dev.off())
+  invisible(file)
+}
+```
+
+```{r read-data}
+# ==============================================================================
+# Reading data
+# ==============================================================================
+c_df <- read_csv("~/Documents/Davis/DDSC/Analyzing Unemployment Project/cps_monthly_hazards.csv")
+p_df <- read_parquet("~/Documents/Davis/DDSC/Analyzing Unemployment Project/cps_master_panel_2005_2026.parquet",
+                     col_select = c(RACE, EMPSTAT, WHYUNEMP))
+
+c_df <- c_df |>
+  select(U_short, f_shimer, lambda_t)
+
+# RACE is grouped into broad categories from the numeric IPUMS codes. Check the
+# groupings against the RACE variable page on IPUMS CPS. Do this BEFORE any
+# factor() call on RACE, because it uses the numeric codes.
+p_df <- p_df |>
+  mutate(
+    race_grp = case_when(
+      RACE == 100            ~ "White",
+      RACE == 200            ~ "Black",
+      RACE == 300            ~ "American Indian / Alaska Native",
+      RACE %in% c(650, 651)  ~ "Asian",
+      RACE == 652            ~ "Pacific Islander",
+      RACE == 700            ~ "Other single race",
+      RACE >= 801            ~ "Two or more races",
+      TRUE                   ~ NA_character_
+    ),
+    EMPSTAT = factor(EMPSTAT,
+                     levels = c(0, 1, 10, 12, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36),
+                     labels = c("NIU", "Armed Forces", "At work", "Has job, not at work",
+                                "Unemployed", "Unemployed, experienced",
+                                "Unemployed, new worker", "NILF", "NILF, housework",
+                                "NILF, unable to work", "NILF, school", "NILF, other",
+                                "NILF, unpaid work", "NILF, retired")),
+    WHYUNEMP = factor(WHYUNEMP,
+                      levels = 0:6,
+                      labels = c("NIU", "Job loser/layoff", "Other job loser",
+                                 "Temp job ended", "Job leaver", "Re-entrant",
+                                 "New entrant"))
+  )
+```
+
+# 1. Data overview
+
+The analysis uses monthly labor market measures (one row per month) and a person-level
+panel of survey records (one row per person per month). Both are built from the Current
+Population Survey (CPS), obtained through IPUMS.
+
+```{r data-dictionary}
+# ==============================================================================
+# Data dictionary
+# ==============================================================================
+data_dict <- tribble(
+  ~Variable,    ~`Plain-language name`,              ~Type,            ~Description,
+  "U_short",    "Short-term unemployed",             "Monthly count",  "Number of people who have been unemployed for only a short time (under 5 weeks).",
+  "f_shimer",   "Job-finding probability",           "Share (0 to 1)", "Chance that an unemployed person finds a job by the next month, corrected for survey measurement error.",
+  "lambda_t",   "Job-finding rate",                  "Rate",           "The same job-finding measure expressed as a continuous-time monthly rate.",
+  "RACE",       "Race",                              "Category",       "Race group, collapsed from detailed IPUMS codes into broad categories.",
+  "EMPSTAT",    "Employment status",                 "Category",       "Whether a person is working, unemployed, or outside the labor force.",
+  "WHYUNEMP",   "Reason for unemployment",           "Category",       "Why an unemployed person is out of work. Asked of unemployed people only."
+)
+
+dict_note <- sprintf("Monthly measures cover %d months. The person-level panel has %s person-month records. Source: IPUMS CPS, 2005 onward.",
+                     nrow(c_df), comma(nrow(p_df)))
+
+# Save the table as a figure
+save_table_png(data_dict, "figures/tbl_data_dictionary.png",
+               title = "Variables used in this report", note = dict_note,
+               align = c("l", "l", "l", "l"),
+               wrap = c(`Plain-language name` = 22, Type = 16, Description = 52))
+
+data_dict |>
+  kbl(booktabs = TRUE, caption = "Variables used in this report",
+      align = c("l", "l", "l", "l")) |>
+  kable_styling(latex_options = c("striped", "hold_position"), font_size = 9) |>
+  row_spec(0, bold = TRUE) |>
+  column_spec(1, width = "2cm", monospace = TRUE) |>
+  column_spec(2, width = "3.4cm") |>
+  column_spec(3, width = "2.4cm") |>
+  column_spec(4, width = "7cm") |>
+  footnote(general = dict_note,
+           general_title = "Note: ", footnote_as_chunk = TRUE)
+```
+
+# 2. Numerical variables
+
+```{r numeric-table}
+# ==============================================================================
+# Summary statistics table (replaces describe(c_df))
+# ==============================================================================
+num_info <- tibble(
+  variable    = c("U_short", "f_shimer", "lambda_t"),
+  Measure     = c("Short-term unemployed (people)",
+                  "Job-finding probability",
+                  "Job-finding rate"),
+  digits      = c(0, 3, 3)
+)
+
+fmt <- function(x, d) ifelse(d == 0, comma(x, accuracy = 1), sprintf("%.3f", x))
+
+num_table <- c_df |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  group_by(variable) |>
+  summarise(Mean      = mean(value, na.rm = TRUE),
+            Median    = median(value, na.rm = TRUE),
+            `Std. dev.` = sd(value, na.rm = TRUE),
+            Min       = min(value, na.rm = TRUE),
+            Max       = max(value, na.rm = TRUE),
+            .groups = "drop") |>
+  left_join(num_info, by = "variable") |>
+  mutate(Mean = fmt(Mean, digits),
+         Median = fmt(Median, digits),
+         `Std. dev.` = fmt(`Std. dev.`, digits),
+         Min = fmt(Min, digits),
+         Max = fmt(Max, digits)) |>
+  select(Measure, Mean, Median, `Std. dev.`, Min, Max)
+
+num_note <- sprintf("Each statistic is computed across %d months. Std. dev. shows typical month-to-month variation. A large gap between the mean and the median points to a few unusually extreme months.",
+                    nrow(c_df))
+
+# Save the table as a figure
+save_table_png(num_table, "figures/tbl_numeric_summary.png",
+               title = "Summary of monthly labor market measures",
+               note = paste("How to read:", num_note),
+               align = c("l", "r", "r", "r", "r", "r"))
+
+num_table |>
+  kbl(booktabs = TRUE, align = c("l", "r", "r", "r", "r", "r"),
+      caption = "Summary of monthly labor market measures") |>
+  kable_styling(latex_options = c("striped", "hold_position")) |>
+  row_spec(0, bold = TRUE) |>
+  column_spec(1, width = "5cm") |>
+  footnote(general = num_note,
+           general_title = "How to read: ", footnote_as_chunk = TRUE)
+```
+
+```{r numeric-plots-prep}
+var_labels <- c(U_short  = "Short-term unemployed (count)",
+                f_shimer = "Job-finding probability (Shimer)",
+                lambda_t = "Job-finding rate (continuous time)")
+
+c_long <- c_df |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  mutate(variable = factor(variable, levels = names(var_labels), labels = var_labels))
+
+c_stats <- c_long |>
+  group_by(variable) |>
+  summarise(mean = mean(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE),
+            .groups = "drop")
+```
+
+```{r histograms, fig.width=10, fig.height=4.5, out.width="100%"}
+# ---- Histograms with mean and median lines ----
+p_hist <- ggplot(c_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = col_main, color = "white", alpha = 0.9) +
+  geom_vline(data = c_stats, aes(xintercept = median, color = "Median"),
+             linewidth = 0.9) +
+  geom_vline(data = c_stats, aes(xintercept = mean, color = "Mean"),
+             linewidth = 0.9, linetype = "dashed") +
+  scale_color_manual(values = c(Median = col_accent, Mean = "black"), name = NULL) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(title = "Distributions of the unemployment flow variables",
+       subtitle = "Monthly observations, January 2005 onward",
+       x = NULL, y = "Number of months") +
+  theme_proj()
+print(p_hist)
+ggsave("figures/num_histograms.png", p_hist, width = 11, height = 4.5, dpi = 200)
+```
+
+```{r boxplots, fig.width=8, fig.height=6.5, out.width="90%"}
+# ---- Boxplots ----
+p_box <- ggplot(c_long, aes(x = value, y = "")) +
+  geom_boxplot(fill = col_main, color = col_main, alpha = 0.3, width = 0.5,
+               outlier.color = col_accent, outlier.size = 2.2) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 1) +
+  labs(title = "Spread and outliers",
+       subtitle = "Orange points lie beyond 1.5 x IQR from the box",
+       x = NULL, y = NULL) +
+  theme_proj() +
+  theme(axis.text.y = element_blank(),
+        panel.grid.major.y = element_blank())
+print(p_box)
+ggsave("figures/num_boxplots.png", p_box, width = 8, height = 6.5, dpi = 200)
+```
+
+# 3. Categorical variables
+
+Each table shows how many person-month records fall into each category and the share of
+the total. "Not in universe" means the survey question did not apply to that person.
+
+```{r prop-function}
+# ==============================================================================
+# Proportion table function (replaces prop_tbl printouts)
+# ==============================================================================
+prop_kable <- function(data, var, caption, note = NULL, file = NULL) {
+  d <- data |>
+    count({{ var }}) |>
+    filter(!is.na({{ var }})) |>
+    arrange(desc(n)) |>
+    mutate(share = n / sum(n))
+
+  n_missing <- nrow(data) - sum(d$n)
+
+  out <- d |>
+    transmute(
+      Category = as.character({{ var }}) |>
+        str_replace("^NILF", "Not in labor force") |>
+        str_replace("^NIU$", "Not in universe"),
+      Observations = comma(n),
+      Share = ifelse(share < 0.001, "<0.1%", percent(share, accuracy = 0.1))
+    )
+
+  tbl <- bind_rows(out,
+                   tibble(Category = "Total",
+                          Observations = comma(sum(d$n)),
+                          Share = "100.0%"))
+
+  notes <- c(note,
+             if (n_missing > 0)
+               paste0(comma(n_missing), " records with missing or unlabeled values are excluded.")) 
+
+  # Save the table as a figure
+  if (!is.null(file)) {
+    save_table_png(tbl, file, title = caption,
+                   note = paste(notes, collapse = " "),
+                   align = c("l", "r", "r"), bold_last_row = TRUE)
+  }
+
+  k <- tbl |>
+    kbl(booktabs = TRUE, align = c("l", "r", "r"), caption = caption) |>
+    kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) |>
+    row_spec(0, bold = TRUE) |>
+    row_spec(nrow(tbl), bold = TRUE)
+
+  if (length(notes) > 0) {
+    k <- k |> footnote(general = notes, general_title = "Note: ",
+                       footnote_as_chunk = TRUE)
+  }
+  k
+}
+```
+
+## Employment status
+
+```{r empstat-table}
+prop_kable(p_df, EMPSTAT, "Employment status of survey respondents",
+           note = "Observations are person-month records.",
+           file = "figures/tbl_empstat.png")
+```
+
+```{r empstat-plot, fig.width=9, fig.height=6, out.width="100%"}
+# ---- Bar chart function: horizontal, sorted, with percent labels ----
+bar_plot <- function(data, var, title, subtitle = NULL, fill = col_main) {
+  d <- data |>
+    count({{ var }}) |>
+    filter(!is.na({{ var }})) |>
+    mutate(prop = n / sum(n),
+           category = fct_reorder(as.character({{ var }}), n),
+           label = ifelse(prop < 0.001, "<0.1%", percent(prop, accuracy = 0.1)))
+
+  n_missing <- nrow(data) - sum(d$n)
+  cap <- paste0("n = ", comma(sum(d$n)), " observations",
+                if (n_missing > 0) paste0(" (", comma(n_missing), " with missing/unlabeled values excluded)"))
+
+  ggplot(d, aes(x = prop, y = category)) +
+    geom_col(fill = fill, width = 0.72) +
+    geom_text(aes(label = label), hjust = -0.12, size = 3.6, color = "grey25") +
+    scale_x_continuous(labels = percent, expand = expansion(mult = c(0, 0.14))) +
+    labs(title = title, subtitle = subtitle, caption = cap,
+         x = "Share of observations", y = NULL) +
+    theme_proj() +
+    theme(panel.grid.major.y = element_blank())
+}
+
+p_emp <- bar_plot(p_df, EMPSTAT, "Employment status",
+                  "Share of person-month observations", fill = col_main)
+print(p_emp)
+ggsave("figures/cat_empstat.png", p_emp, width = 9, height = 6, dpi = 200)
+```
+
+## Race
+
+```{r race-table}
+prop_kable(p_df, race_grp, "Race of survey respondents (broad groups)",
+           note = "Groups are collapsed from detailed IPUMS CPS race codes.",
+           file = "figures/tbl_race.png")
+```
+
+```{r race-plot, fig.width=9, fig.height=4.5, out.width="100%"}
+p_race <- bar_plot(p_df, race_grp, "Race",
+                   "Broad groups from IPUMS CPS RACE codes", fill = col_purple)
+print(p_race)
+ggsave("figures/cat_race.png", p_race, width = 9, height = 4.5, dpi = 200)
+```
+
+## Reason for unemployment
+
+```{r why-table}
+p_df |>
+  filter(WHYUNEMP != "NIU") |>
+  prop_kable(WHYUNEMP, "Reason for unemployment (unemployed people only)",
+             note = "People who are not unemployed are excluded because the question does not apply to them.",
+             file = "figures/tbl_whyunemp.png")
+```
+
+```{r why-plot, fig.width=9, fig.height=4.5, out.width="100%"}
+p_why <- p_df |>
+  filter(WHYUNEMP != "NIU") |>
+  bar_plot(WHYUNEMP, "Reason for unemployment",
+           "Unemployed people only (not-in-universe rows removed)", fill = col_green)
+print(p_why)
+ggsave("figures/cat_whyunemp.png", p_why, width = 9, height = 4.5, dpi = 200)
+```

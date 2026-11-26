@@ -1,0 +1,432 @@
+---
+title: "Week2 DMP Analysis"
+author: "Steve Naing"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+```{r source, include=FALSE}
+source("DDSC_Economics_Features_Fall2026.R")
+```
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# DMP (DIAMOND-MORTENSEN-PISSARIDES) FRAMEWORK: MODEL ESTIMATION AND EDA
+# ==============================================================================
+# Needs `macro_macro_df` from DDSC_Economics_Features_Fall2026.R, with columns:
+#   date, E_t, U_t, UE, EU, V_t
+#
+# Model:
+#   Matching function     M = A * U^eta * V^(1 - eta)
+#   Tightness             theta = V / U
+#   Job-finding rate      f(theta) = M / U = A * theta^(1 - eta)
+#   Vacancy-filling rate  q(theta) = M / V = A * theta^(-eta)
+#   Steady state          u = s / (s + f(theta)),  v = theta * u   (Beveridge curve)
+#
+# Contents:
+#   Part A  Build variables and estimate the model
+#   Part B  Model plots: f(theta), q(theta), fit over time, Beveridge curve, A(t)
+#   Part C  EDA: summary stats, distributions, correlations,
+#           separation rate vs predicted job finding, DMP-implied unemployment
+
+library(tidyverse)
+library(lubridate)
+library(scales)
+
+theme_set(theme_minimal(base_size = 12))
+dir.create("figures", showWarnings = FALSE)
+```
+
+```{r Building variables and Estimating the Model}
+# ==============================================================================
+# PART A: BUILD VARIABLES AND ESTIMATE THE MODEL
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# A1. Build the variables
+# ------------------------------------------------------------------------------
+# JOLTS vacancies (JTSJOL) are in THOUSANDS; CPS counts are in persons.
+covid_start <- as.Date("2020-03-01")
+covid_end   <- as.Date("2021-12-01")
+
+dmp <- macro_macro_df %>%
+  mutate(
+    V_persons = V_t * 1000,
+    L         = E_t + U_t,
+    theta     = V_persons / U_t,        # market tightness
+    f_obs     = UE / U_t,               # observed job-finding rate
+    q_obs     = UE / V_persons,         # observed vacancy-filling rate
+    s_obs     = EU / E_t,               # observed separation rate
+    u_rate    = U_t / L,
+    v_rate    = V_persons / L,
+    log_f     = log(f_obs),
+    log_theta = log(theta),
+    covid     = date >= covid_start & date <= covid_end,
+    era       = cut(date,
+                    breaks = as.Date(c("2004-12-31", "2007-12-31", "2014-12-31",
+                                       "2019-12-31", "2021-12-31", "2100-01-01")),
+                    labels = c("2005-07", "2008-14", "2015-19", "2020-21", "2022+"))
+  ) %>%
+  filter(is.finite(log_f), is.finite(log_theta))
+```
+
+```{r Estimating the model}
+# ------------------------------------------------------------------------------
+# A2. Estimate the model: log f = log A + (1 - eta) * log theta
+# ------------------------------------------------------------------------------
+fit_all   <- lm(log_f ~ log_theta, data = dmp)
+fit_nocov <- lm(log_f ~ log_theta, data = filter(dmp, !covid))
+
+pars <- function(fit) {
+  b <- coef(fit)
+  tibble(A = unname(exp(b[1])),
+         vacancy_elasticity = unname(b[2]),   # 1 - eta
+         eta = unname(1 - b[2]),              # unemployment elasticity
+         r_squared = summary(fit)$r.squared)
+}
+
+est <- bind_rows(
+  `Full sample`     = pars(fit_all),
+  `Excluding COVID` = pars(fit_nocov),
+  .id = "sample"
+)
+cat("\n=== DMP matching-function estimates ===\n")
+print(est, width = Inf)
+
+# Returns-to-scale check: the coefficient on log(U) equals
+# (eta + vacancy elasticity) - 1, so 0 means constant returns to scale.
+fit_crs <- lm(log_f ~ log_theta + log(U_t), data = dmp)
+cat("\n=== Constant-returns check (coefficient on log(U_t) should be 0) ===\n")
+print(round(summary(fit_crs)$coefficients, 4))
+
+# Baseline model used below: estimated excluding COVID months, then applied to
+# ALL months, so the COVID period is an out-of-sample test of the model.
+A_hat <- est$A[est$sample == "Excluding COVID"]
+slope <- est$vacancy_elasticity[est$sample == "Excluding COVID"]
+eta   <- 1 - slope
+
+dmp <- dmp %>%
+  mutate(
+    f_fit    = A_hat * theta^slope,
+    q_fit    = A_hat * theta^(slope - 1),     # = A * theta^(-eta)
+    A_t      = f_obs / theta^slope,           # implied efficiency
+    f_obs_ma = (dplyr::lag(f_obs) + f_obs + dplyr::lead(f_obs)) / 3,
+    A_t_ma   = (dplyr::lag(A_t) + A_t + dplyr::lead(A_t)) / 3
+  )
+
+# Helpers: shaded recession windows and the era color scale
+# Great Recession dates follow the NBER business-cycle dates (Dec 2007 - Jun 2009).
+recession_start <- as.Date("2007-12-01")
+recession_end   <- as.Date("2009-06-30")
+
+# COVID recession per NBER: peak Feb 2020, trough Apr 2020. The longer window
+# (covid_start to covid_end, Mar 2020 - Dec 2021) is used only to exclude the
+# pandemic period from the regression, so it is not shaded on the plots.
+covid_rec_start <- as.Date("2020-02-01")
+covid_rec_end   <- as.Date("2020-04-30")
+
+covid_rect     <- annotate("rect", xmin = covid_rec_start, xmax = covid_rec_end,
+                           ymin = -Inf, ymax = Inf, alpha = 0.12)
+recession_rect <- annotate("rect", xmin = recession_start, xmax = recession_end,
+                           ymin = -Inf, ymax = Inf, alpha = 0.12)
+
+# Add both windows to a plot with: ggplot(...) + shaded_periods + ...
+shaded_periods <- list(recession_rect, covid_rect)
+shade_caption  <- "Shaded areas: Great Recession (Dec 2007 - Jun 2009) and COVID-19 recession (Feb - Apr 2020)"
+
+era_colors <- scale_color_brewer(palette = "Dark2", name = "Period")
+```
+
+```{r Model Plots}
+# ==============================================================================
+# PART B: MODEL PLOTS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# B1. Job-finding rate f(theta) vs market tightness
+# ------------------------------------------------------------------------------
+th <- seq(min(dmp$theta), max(dmp$theta), length.out = 200)
+f_curves <- bind_rows(
+  tibble(theta = th,
+         f = unname(exp(coef(fit_nocov)[1])) * th^unname(coef(fit_nocov)[2]),
+         model = "Excluding COVID"),
+  tibble(theta = th,
+         f = unname(exp(coef(fit_all)[1])) * th^unname(coef(fit_all)[2]),
+         model = "Full sample")
+)
+
+# Subtitle and caption use plotmath, so θ and η draw as Greek letters on any device.
+p1 <- ggplot(dmp, aes(theta, f_obs)) +
+  geom_point(aes(color = era), size = 2) +
+  geom_line(data = f_curves, aes(theta, f, linetype = model), linewidth = 1) +
+  era_colors +
+  labs(title = "DMP: job-finding rate rises with market tightness",
+       subtitle = bquote(f(theta) == A %.% theta^(1 - eta) ~ "with" ~
+                           A == .(round(A_hat, 2)) ~ "and" ~
+                           1 - eta == .(round(slope, 2)) ~ "(excluding Mar 2020 - Dec 2021)"),
+       caption = bquote(f(theta) ~ "= job-finding rate;" ~ A ~
+                          "= matching efficiency;" ~ eta ~
+                          "= elasticity of matches with respect to unemployment"),
+       x = "Job Market Tightness, θ = vacancies / unemployed",
+       y = "Job-finding rate", linetype = "Fitted curve")
+print(p1)
+ggsave("figures/dmp_01_job_finding_curve.png", p1, width = 8, height = 5, dpi = 150)
+```
+
+```{r Vacancy-filling rate vs Tightness}
+# ------------------------------------------------------------------------------
+# B2. Vacancy-filling rate q(theta) vs tightness
+# ------------------------------------------------------------------------------
+q_curve <- tibble(theta = th, q = A_hat * th^(slope - 1))
+
+p2 <- ggplot(dmp, aes(theta, q_obs)) +
+  geom_point(aes(color = era), size = 2) +
+  geom_line(data = q_curve, aes(theta, q), linewidth = 1) +
+  era_colors +
+  labs(title = "DMP: vacancies fill more slowly when the market is tight",
+       subtitle = bquote(q(theta) == A %.% theta^(-eta) ~ "with" ~
+                           eta == .(round(eta, 2))),
+       x = "Job Market Tightness, θ = vacancies / unemployed",
+       y = "Vacancy-filling rate, UE / V")
+print(p2)
+ggsave("figures/dmp_02_vacancy_filling_curve.png", p2, width = 8, height = 5, dpi = 150)
+```
+
+```{r Observed vs DMP-predicted job-finding rate}
+# ------------------------------------------------------------------------------
+# B3. Observed vs DMP-predicted job-finding rate over time
+# ------------------------------------------------------------------------------
+p3 <- ggplot(dmp, aes(date)) +
+  shaded_periods +
+  geom_line(aes(y = f_obs, color = "Observed (monthly)"), alpha = 0.4) +
+  geom_line(aes(y = f_obs_ma, color = "Observed (3-month average)"), linewidth = 0.9) +
+  geom_line(aes(y = f_fit, color = "DMP prediction (constant A)"), linewidth = 1) +
+  scale_color_manual(values = c("Observed (monthly)" = "grey50",
+                                "Observed (3-month average)" = "#1b9e77",
+                                "DMP prediction (constant A)" = "#d95f02")) +
+  labs(title = "DMP prediction vs observed job-finding rate",
+       subtitle = "Prediction uses only market tightness and a constant matching efficiency",
+       caption = shade_caption,
+       x = NULL, y = "Job-finding rate", color = NULL)
+print(p3)
+ggsave("figures/dmp_03_fit_over_time.png", p3, width = 8, height = 4.5, dpi = 150)
+```
+
+```{r Beveridge curve}
+# ------------------------------------------------------------------------------
+# B4. Beveridge curve: empirical points vs DMP steady-state curve
+# ------------------------------------------------------------------------------
+# Steady state at a given theta: u = s / (s + f(theta)), v = theta * u,
+# holding the separation rate at its median.
+s_bar <- median(dmp$s_obs, na.rm = TRUE)
+bev_curve <- tibble(theta = th) %>%
+  mutate(u = s_bar / (s_bar + A_hat * theta^slope),
+         v = theta * u)
+
+p4 <- ggplot() +
+  geom_path(data = dmp, aes(u_rate, v_rate), color = "grey80") +
+  geom_point(data = dmp, aes(u_rate, v_rate, color = era), size = 2) +
+  geom_line(data = bev_curve, aes(u, v), linewidth = 1.1) +
+  era_colors +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  coord_cartesian(xlim = range(dmp$u_rate) * c(0.9, 1.1),
+                  ylim = range(dmp$v_rate) * c(0.9, 1.1)) +
+  labs(title = "Beveridge curve: data vs DMP steady state",
+       subtitle = "Black line = curve implied by constant A and median separation rate",
+       x = "Unemployment rate, U / L", y = "Vacancy rate, V / L")
+print(p4)
+ggsave("figures/dmp_04_beveridge.png", p4, width = 8, height = 5.5, dpi = 150)
+```
+
+```{r Implied matching efficiency A(t)}
+# ------------------------------------------------------------------------------
+# B5. Implied matching efficiency A(t)
+# ------------------------------------------------------------------------------
+p5 <- ggplot(dmp, aes(date)) +
+  shaded_periods +
+  geom_line(aes(y = A_t), color = "grey60") +
+  geom_line(aes(y = A_t_ma), linewidth = 1) +
+  geom_hline(yintercept = A_hat, linetype = "dashed") +
+  labs(title = "Implied matching efficiency A(t)",
+       subtitle = bquote(A(t) == f / theta^(1 - eta) ~
+                           "(black = 3-month average, dashed = constant A)"),
+       caption = shade_caption,
+       x = NULL, y = "A(t)")
+print(p5)
+ggsave("figures/dmp_05_efficiency.png", p5, width = 8, height = 4.5, dpi = 150)
+
+# ------------------------------------------------------------------------------
+# B6. Fit summary by period
+# ------------------------------------------------------------------------------
+fit_by_era <- dmp %>%
+  group_by(era) %>%
+  summarise(mean_observed  = mean(f_obs),
+            mean_predicted = mean(f_fit),
+            mean_gap       = mean(f_obs - f_fit),
+            mean_A         = mean(A_t),
+            .groups = "drop")
+cat("\n=== Observed vs predicted job-finding rate by period ===\n")
+print(fit_by_era, width = Inf)
+```
+
+```{r EDA on DMP Variables}
+# ==============================================================================
+# PART C: EDA ON THE DMP VARIABLES
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# C1. Summary statistics
+# ------------------------------------------------------------------------------
+dmp_vars <- dmp %>%
+  select(theta, f_obs, f_fit, q_obs, s_obs, A_t, u_rate, v_rate)
+
+summary_tbl <- dmp_vars %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(n      = sum(!is.na(value)),
+            mean   = mean(value, na.rm = TRUE),
+            sd     = sd(value, na.rm = TRUE),
+            min    = min(value, na.rm = TRUE),
+            q25    = quantile(value, 0.25, na.rm = TRUE),
+            median = median(value, na.rm = TRUE),
+            q75    = quantile(value, 0.75, na.rm = TRUE),
+            max    = max(value, na.rm = TRUE),
+            .groups = "drop")
+
+cat("\n=== Summary statistics: DMP variables ===\n")
+print(summary_tbl, n = Inf, width = Inf)
+```
+
+```{r Distributions}
+# ------------------------------------------------------------------------------
+# C2. Distributions: histograms and boxplots
+# ------------------------------------------------------------------------------
+var_labels <- c(theta = "Tightness (V/U)",
+                f_obs = "Job-finding rate (UE/U)",
+                q_obs = "Vacancy-filling rate (UE/V)",
+                s_obs = "Separation rate (EU/E)",
+                A_t   = "Matching efficiency A(t)")
+
+dist_long <- dmp %>%
+  select(all_of(names(var_labels))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(variable, levels = names(var_labels), labels = var_labels))
+
+p6 <- ggplot(dist_long, aes(value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(title = "Distributions of DMP variables", x = NULL, y = "Count")
+print(p6)
+ggsave("figures/eda_01_histograms.png", p6, width = 10, height = 6, dpi = 150)
+
+p7 <- ggplot(dist_long, aes(y = value)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 5) +
+  labs(title = "Boxplots of DMP variables", y = NULL) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+print(p7)
+ggsave("figures/eda_02_boxplots.png", p7, width = 11, height = 4.5, dpi = 150)
+```
+
+```{r Correlations among DMP variables}
+# ------------------------------------------------------------------------------
+# C3. Correlations among DMP variables (plain-language names)
+# ------------------------------------------------------------------------------
+cor_labels <- c(theta  = "Market tightness",
+                f_obs  = "Job-finding rate",
+                q_obs  = "Vacancy-filling rate",
+                s_obs  = "Job-separation rate",
+                A_t    = "Matching efficiency",
+                u_rate = "Unemployment rate",
+                v_rate = "Vacancy rate")
+
+cor_mat <- cor(select(dmp, all_of(names(cor_labels))),
+               use = "pairwise.complete.obs")
+cat("\n=== Correlation matrix ===\n")
+print(round(cor_mat, 2))
+
+cor_long <- as.data.frame(as.table(cor_mat)) %>%
+  rename(var1 = Var1, var2 = Var2, r = Freq) %>%
+  mutate(var1 = factor(var1, levels = names(cor_labels), labels = cor_labels),
+         var2 = factor(var2, levels = rev(names(cor_labels)), labels = rev(cor_labels)))
+
+p8 <- ggplot(cor_long, aes(var1, var2, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(r, 2)), size = 3.2) +
+  scale_fill_gradient2(limits = c(-1, 1), low = "#b2182b", mid = "white",
+                       high = "#2166ac", name = "Correlation") +
+  labs(title = "Correlations among labor market variables",
+       subtitle = "Blue = move together, red = move in opposite directions (-1 to +1)",
+       x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid = element_blank())
+print(p8)
+ggsave("figures/eda_03_correlations.png", p8, width = 8, height = 6, dpi = 150)
+```
+
+```{r Separation rate vs DMP-predicted job-finding rate}
+# ------------------------------------------------------------------------------
+# C4. Separation rate vs DMP-predicted job-finding rate: over time
+# ------------------------------------------------------------------------------
+# The two rates are on very different scales, so each gets its own y-axis.
+sep_f_long <- dmp %>%
+  transmute(date,
+            `Separation rate, EU / E (3-month avg)` =
+              (dplyr::lag(s_obs) + s_obs + dplyr::lead(s_obs)) / 3,
+            `DMP-predicted job-finding rate` = f_fit) %>%
+  pivot_longer(-date, names_to = "series", values_to = "rate")
+
+p9 <- ggplot(sep_f_long, aes(date, rate)) +
+  shaded_periods +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ series, ncol = 1, scales = "free_y") +
+  labs(title = "Separation rate vs DMP-predicted job-finding rate",
+       subtitle = "Separations spike in recessions; predicted job finding falls with tightness",
+       caption = shade_caption,
+       x = NULL, y = "Monthly rate")
+print(p9)
+ggsave("figures/eda_04_separation_vs_predicted_f.png", p9, width = 8, height = 6, dpi = 150)
+```
+
+```{r Separation rate vs Predicted job-finding rate}
+# ------------------------------------------------------------------------------
+# C5. Separation rate vs predicted job-finding rate: scatter
+# ------------------------------------------------------------------------------
+r_all   <- cor(dmp$s_obs, dmp$f_fit, use = "complete.obs")
+r_nocov <- cor(dmp$s_obs[!dmp$covid], dmp$f_fit[!dmp$covid], use = "complete.obs")
+
+p10 <- ggplot(dmp, aes(f_fit, s_obs)) +
+  geom_point(aes(color = era), size = 2) +
+  geom_smooth(data = filter(dmp, !covid), method = "lm", se = FALSE, color = "black") +
+  era_colors +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Separation rate vs DMP-predicted job-finding rate",
+       subtitle = sprintf("Correlation: %.2f (all months), %.2f (excluding COVID). Line fitted excluding COVID",
+                          r_all, r_nocov),
+       x = "DMP-predicted job-finding rate", y = "Separation rate, EU / E")
+print(p10)
+ggsave("figures/eda_05_separation_vs_f_scatter.png", p10, width = 8, height = 5, dpi = 150)
+```
+
+```{r Job-finding vs Observed Separations}
+# ------------------------------------------------------------------------------
+# C6. Unemployment implied by predicted job finding and observed separations
+# ------------------------------------------------------------------------------
+# u_dmp = s / (s + f_fit): unemployment at steady state if the job-finding rate
+# follows tightness and the separation rate is as observed.
+dmp <- dmp %>% mutate(u_dmp = s_obs / (s_obs + f_fit))
+
+p11 <- dmp %>%
+  select(date, Actual = u_rate, `DMP-implied steady state` = u_dmp) %>%
+  pivot_longer(-date, names_to = "series", values_to = "rate") %>%
+  ggplot(aes(date, rate, color = series)) +
+  shaded_periods +
+  geom_line(linewidth = 0.8) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Actual unemployment vs DMP-implied steady state",
+       subtitle = bquote("Implied rate =" ~ s / (s + f) ~ "using the predicted job-finding rate f"),
+       caption = shade_caption,
+       x = NULL, y = "Unemployment rate", color = NULL)
+print(p11)
+ggsave("figures/eda_06_actual_vs_dmp_implied_u.png", p11, width = 8, height = 4.5, dpi = 150)
+```
